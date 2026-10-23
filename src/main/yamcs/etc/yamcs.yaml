@@ -1,0 +1,24 @@
+# Development configuration, started with: mvn yamcs:run
+# The S3 settings can be overridden with environment variables; the defaults match a local SeaweedFS:
+#   docker run --rm -p 8333:8333 chrislusf/seaweedfs:4.46 server -s3 -dir=/data -ip.bind=0.0.0.0
+services:
+  - class: org.yamcs.http.HttpServer
+    args:
+      port: 8090
+
+dataDir: yamcs-data
+
+instances: []
+
+secretKey: changeme
+
+bucketProviders:
+  - type: s3
+    endpoint: ${env.S3_ENDPOINT:http://localhost:8333}
+    region: ${env.S3_REGION:us-east-1}
+    accessKeyId: ${env.S3_ACCESS_KEY_ID:test}
+    secretAccessKey: ${env.S3_SECRET_ACCESS_KEY:test}
+    pathStyleAccess: true
+    buckets:
+      - name: ${env.S3_BUCKET:yamcs-dev}
+        localName: s3
