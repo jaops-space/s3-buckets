@@ -4,11 +4,41 @@
 
   <groupId>com.jaops.yamcs</groupId>
   <artifactId>s3-buckets</artifactId>
-  <version>0.0.1-SNAPSHOT</version>
+  <version>0.1.0</version>
   <packaging>jar</packaging>
 
   <name>Yamcs S3 Buckets</name>
   <description>Yamcs bucket provider storing objects in S3 (or S3-compatible) object storage</description>
+  <url>https://github.com/jaops/s3-buckets</url>
+
+  <licenses>
+    <license>
+      <name>GNU Affero General Public License (AGPL)</name>
+      <url>https://www.gnu.org/licenses/agpl-3.0.html</url>
+    </license>
+  </licenses>
+
+  <scm>
+    <connection>scm:git:https://github.com/jaops/s3-buckets.git</connection>
+    <developerConnection>scm:git:git@github.com:jaops/s3-buckets.git</developerConnection>
+    <url>https://github.com/jaops/s3-buckets</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <organization>
+    <name>Jaops</name>
+    <url>https://jaops.com</url>
+  </organization>
+
+  <developers>
+    <developer>
+      <id>jaops</id>
+      <name>Jaops</name>
+      <email>yamcs@jaops.com</email>
+      <organization>Jaops</organization>
+      <organizationUrl>https://jaops.com</organizationUrl>
+    </developer>
+  </developers>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -137,4 +167,78 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <!-- Release to Maven Central: mvn -Pjaops-release deploy -->
+    <profile>
+      <id>jaops-release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.6.3</version>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <release>17</release>
+              <author>false</author>
+              <links>
+                <link>https://docs.yamcs.org/javadoc/yamcs/latest/</link>
+              </links>
+              <doclint>none</doclint>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.2</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+            <configuration>
+              <!-- Jaops Release Signing <yamcs@jaops.com> -->
+              <keyname>C56E028076F3CCB9</keyname>
+            </configuration>
+          </plugin>
+          <plugin>
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.11.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <!-- Token of the Jaops account on central.sonatype.com, in ~/.m2/settings.xml -->
+              <publishingServerId>central-jaops</publishingServerId>
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
 </project>
