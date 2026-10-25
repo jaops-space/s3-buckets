@@ -9,7 +9,7 @@
 
   <name>Yamcs S3 Buckets</name>
   <description>Yamcs bucket provider storing objects in S3 (or S3-compatible) object storage</description>
-  <url>https://github.com/jaops/s3-buckets</url>
+  <url>https://github.com/jaops-space/s3-buckets</url>
 
   <licenses>
     <license>
@@ -19,9 +19,9 @@
   </licenses>
 
   <scm>
-    <connection>scm:git:https://github.com/jaops/s3-buckets.git</connection>
-    <developerConnection>scm:git:git@github.com:jaops/s3-buckets.git</developerConnection>
-    <url>https://github.com/jaops/s3-buckets</url>
+    <connection>scm:git:https://github.com/jaops-space/s3-buckets.git</connection>
+    <developerConnection>scm:git:git@github.com:jaops-space/s3-buckets.git</developerConnection>
+    <url>https://github.com/jaops-space/s3-buckets</url>
     <tag>HEAD</tag>
   </scm>
 
