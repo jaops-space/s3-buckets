@@ -48,7 +48,7 @@ mvn package -P jaops-release -DskipTests
 
 cd $home
 
-ls -lh $clonedir/target/*.jar $clonedir/target/*.asc
+ls -lh $clonedir/target/*.jar
 echo
 
 if [ $snapshot -eq 0 ]; then
