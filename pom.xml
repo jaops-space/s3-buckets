@@ -4,7 +4,7 @@
 
   <groupId>com.jaops.yamcs</groupId>
   <artifactId>s3-buckets</artifactId>
-  <version>0.2.0-SNAPSHOT</version>
+  <version>0.2.0</version>
   <packaging>jar</packaging>
 
   <name>Yamcs S3 Buckets</name>
