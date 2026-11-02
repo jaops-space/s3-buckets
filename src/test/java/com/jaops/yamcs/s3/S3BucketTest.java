@@ -1,6 +1,7 @@
 package com.jaops.yamcs.s3;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -22,6 +23,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.yamcs.ValidationException;
 import org.yamcs.YConfiguration;
+import org.yamcs.buckets.Bucket;
 import org.yamcs.buckets.ObjectProperties;
 import org.yamcs.utils.TimeEncoding;
 
@@ -61,14 +63,16 @@ public class S3BucketTest {
             throws ValidationException {
         var bucketConfig = new HashMap<String, Object>(bucketOptions);
         bucketConfig.put("name", s3BucketName);
+        return providerConfig(Map.of("buckets", List.of(bucketConfig)));
+    }
 
-        var config = new HashMap<String, Object>();
+    static YConfiguration providerConfig(Map<String, Object> options) throws ValidationException {
+        var config = new HashMap<String, Object>(options);
         config.put("endpoint", "http://" + s3Server.getHost() + ":" + s3Server.getMappedPort(8333));
         config.put("region", "us-east-1");
         config.put("accessKeyId", "test");
         config.put("secretAccessKey", "test");
         config.put("pathStyleAccess", true);
-        config.put("buckets", List.of(bucketConfig));
 
         return YConfiguration.wrap(new S3BucketProvider().getSpec().validate(config));
     }
@@ -242,6 +246,97 @@ public class S3BucketTest {
         config.put("secretAccessKey", "secret");
         config.put("checksums", "SOMETIMES");
         assertThrows(ValidationException.class, () -> spec.validate(config));
+
+        // buckets or folder
+        config.remove("checksums");
+        config.remove("buckets");
+        assertThrows(ValidationException.class, () -> spec.validate(config));
+        config.put("folder", Map.of("name", "b"));
+        assertDoesNotThrow(() -> spec.validate(config));
+    }
+
+    YConfiguration folderConfig(String prefix, List<Map<String, Object>> buckets) throws ValidationException {
+        var options = new HashMap<String, Object>();
+        options.put("folder", Map.of("name", s3BucketName, "prefix", base + prefix));
+        if (!buckets.isEmpty()) {
+            options.put("buckets", buckets);
+        }
+        return providerConfig(options);
+    }
+
+    static List<String> bucketNames(List<Bucket> buckets) {
+        return buckets.stream().map(Bucket::getName).sorted().toList();
+    }
+
+    @Test
+    void folderCreateLoadDelete() throws Exception {
+        var provider = new S3BucketProvider();
+        assertTrue(provider.loadBuckets(folderConfig("yamcs", List.of())).isEmpty());
+
+        var displays = (S3Bucket) provider.createBucket("displays");
+        assertEquals(base + "yamcs/displays/", displays.getPrefix());
+        assertTrue(displays.listObjectsAsync().join().isEmpty());
+        displays.putObjectAsync("a/b.opi", null, null, bytes("x")).join();
+        provider.createBucket("cfdpDown"); // empty: kept by its placeholder
+
+        // The next start finds both
+        var restarted = new S3BucketProvider();
+        var buckets = restarted.loadBuckets(folderConfig("yamcs", List.of()));
+        assertEquals(List.of("cfdpDown", "displays"), bucketNames(buckets));
+        var reloaded = buckets.stream().filter(b -> b.getName().equals("displays")).findFirst().get();
+        assertEquals(List.of("a/b.opi"), names(reloaded.listObjectsAsync().join()));
+
+        // Yamcs deletes only empty buckets
+        var cfdpDown = buckets.stream().filter(b -> b.getName().equals("cfdpDown")).findFirst().get();
+        restarted.deleteBucket(cfdpDown);
+        assertEquals(List.of("displays"), bucketNames(new S3BucketProvider().loadBuckets(folderConfig("yamcs", List.of()))));
+    }
+
+    @Test
+    void folderCreateExisting() throws Exception {
+        // An existing sub-folder without placeholder becomes the bucket, with its objects
+        bucket("f/stacks").putObjectAsync("s1", null, null, bytes("x")).join();
+        var provider = new S3BucketProvider();
+        provider.loadBuckets(folderConfig("f", List.of()));
+        var stacks = provider.createBucket("stacks");
+        assertEquals(List.of("s1"), names(stacks.listObjectsAsync().join()));
+    }
+
+    @Test
+    void folderIgnoredNames() throws Exception {
+        bucket("f/displays").putObjectAsync("x", null, null, bytes("folder")).join();
+        bucket("f/not valid").putObjectAsync("x", null, null, bytes("x")).join();
+        bucket("f/").putObjectAsync("top-level-object", null, null, bytes("x")).join();
+        bucket("elsewhere").putObjectAsync("x", null, null, bytes("configured")).join();
+
+        // The configured bucket wins over the folder's of the same name
+        var provider = new S3BucketProvider();
+        var buckets = provider.loadBuckets(folderConfig("f", List.of(
+                Map.of("name", s3BucketName, "localName", "displays", "prefix", base + "elsewhere"))));
+        assertEquals(List.of("displays"), bucketNames(buckets));
+        assertArrayEquals(bytes("configured"), buckets.get(0).getObjectAsync("x").join());
+        assertThrows(UnsupportedOperationException.class, () -> provider.deleteBucket(buckets.get(0)));
+    }
+
+    @Test
+    void noFolder() throws Exception {
+        var provider = new S3BucketProvider();
+        var buckets = provider.loadBuckets(providerConfig(s3BucketName, Map.of("prefix", base)));
+        assertThrows(UnsupportedOperationException.class, () -> provider.createBucket("displays"));
+        assertThrows(UnsupportedOperationException.class, () -> provider.deleteBucket(buckets.get(0)));
+    }
+
+    @Test
+    void deleteMany() {
+        // More keys than one DeleteObjects request
+        var bucket = bucket("many");
+        var futures = new java.util.ArrayList<java.util.concurrent.CompletableFuture<Void>>();
+        for (int i = 0; i < 1100; i++) {
+            futures.add(bucket.putObjectAsync("obj" + i, null, null, new byte[1]));
+        }
+        futures.forEach(f -> f.join());
+        bucket.deleteAllAsync().join();
+        assertTrue(bucket.listObjectsAsync().join().isEmpty());
     }
 
     static List<String> names(List<ObjectProperties> objects) {

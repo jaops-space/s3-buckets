@@ -4,7 +4,7 @@ Yamcs bucket provider storing the bucket objects in S3 or S3-compatible object s
 Garage, ...). The S3 buckets appear in Yamcs like the other buckets: in the web interface, the HTTP API, the CFDP
 and file transfer services, etc.
 
-It requires Yamcs 5.13.7 or later.
+It requires Yamcs 5.14.0 or later.
 
 ## Installation
 
@@ -30,7 +30,20 @@ bucketProviders:
     buckets:
       - name: my-s3-bucket
         localName: telemetry-files
-        prefix: yamcs/
+        prefix: files/
+```
+
+Or all the buckets in one S3 bucket, each a sub-folder of a folder, created from Yamcs (the Yamcs Web `displays` and
+`stacks`, the CFDP `cfdpDown`, those created in Yamcs Web or with the HTTP API):
+
+```yaml
+bucketProviders:
+  - type: s3
+    region: eu-central-1
+    createBuckets: true
+    folder:
+      name: my-s3-bucket
+      prefix: yamcs/
 ```
 
 endpoint (string)
@@ -54,8 +67,26 @@ checksums (string)
 validates them on downloads; not all S3-compatible servers support this. Default: `WHEN_REQUIRED` if an `endpoint`
 is specified, `WHEN_SUPPORTED` otherwise.
 
+createBuckets (boolean)
+: A Yamcs option of the bucket providers: the buckets that Yamcs creates are created by this provider, as sub-folders
+of `folder` (which it then requires), instead of in the Yamcs database. Only one provider can have it.
+Default: `false`.
+
+folder (map)
+: An S3 bucket and key prefix whose sub-folders are Yamcs buckets: `<prefix><bucket>/<object>`. Those present at
+startup are loaded; a bucket created from Yamcs (`createBuckets`) is an empty placeholder object `<prefix><bucket>/`
+(an existing sub-folder of that name becomes the bucket, with its objects); deleting an (empty) bucket from Yamcs
+deletes its sub-folder. Sub-folders whose name is not a valid Yamcs bucket name (letters, digits, `_` and `-`), or is
+the `localName` of a bucket in `buckets`, are ignored. Options:
+
+  name (string)
+  : **Required.** Name of the S3 bucket. The S3 bucket has to exist.
+
+  prefix (string)
+  : Key prefix of the folder. A `/` is appended if missing. Default: the whole S3 bucket.
+
 buckets (list of maps)
-: **Required.** The S3 buckets made available in Yamcs. Each entry has the options:
+: The S3 buckets made available in Yamcs; `buckets`, `folder` or both are required. Each entry has the options:
 
   name (string)
   : **Required.** Name of the S3 bucket. The S3 bucket has to exist.
@@ -68,8 +99,9 @@ buckets (list of maps)
   appended if missing. The Yamcs object names are the S3 keys without the prefix. Several Yamcs buckets can use
   different prefixes of the same S3 bucket. Default: the whole S3 bucket.
 
-At startup, the access to each S3 bucket is verified in the background; a warning is logged if the bucket cannot be
-accessed, but Yamcs still starts.
+At startup, the access to each S3 bucket of `buckets` is verified in the background; a warning is logged if the
+bucket cannot be accessed, but Yamcs still starts. The `folder` is listed at startup: Yamcs does not start if it
+cannot be listed.
 
 ## Limitations
 
@@ -84,7 +116,9 @@ accessed, but Yamcs still starts.
   is limited (2 KB on AWS).
 * Objects are transferred in one request and kept in memory (as for all Yamcs buckets); the maximum object size is
   5 GB.
-* The buckets cannot be created or deleted from Yamcs.
+* Only the buckets of `folder` can be created and deleted from Yamcs; those of `buckets` are configuration.
+* The folder is listed at startup only: a bucket created by another Yamcs server sharing the folder appears at the
+  next start.
 
 ## Development
 

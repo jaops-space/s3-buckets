@@ -4,7 +4,7 @@
 
   <groupId>com.jaops.yamcs</groupId>
   <artifactId>s3-buckets</artifactId>
-  <version>0.1.1-SNAPSHOT</version>
+  <version>0.2.0-SNAPSHOT</version>
   <packaging>jar</packaging>
 
   <name>Yamcs S3 Buckets</name>
@@ -42,7 +42,7 @@
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <yamcsVersion>5.13.7</yamcsVersion>
+    <yamcsVersion>5.14.0</yamcsVersion>
     <!-- Same as Yamcs (see the netty-bom in the org.yamcs:yamcs pom), the AWS SDK works with it -->
     <nettyVersion>4.1.130.Final</nettyVersion>
     <awsSdkVersion>2.57.2</awsSdkVersion>

@@ -19,6 +19,12 @@ bucketProviders:
     accessKeyId: ${env.S3_ACCESS_KEY_ID:test}
     secretAccessKey: ${env.S3_SECRET_ACCESS_KEY:test}
     pathStyleAccess: true
+    # New buckets (the Yamcs Web displays and stacks, those created in Yamcs Web) are sub-folders of yamcs/
+    createBuckets: true
+    folder:
+      name: ${env.S3_BUCKET:yamcs-dev}
+      prefix: yamcs/
     buckets:
       - name: ${env.S3_BUCKET:yamcs-dev}
         localName: s3
+        prefix: files/

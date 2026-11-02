@@ -1,5 +1,6 @@
 package com.jaops.yamcs.s3;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -19,6 +20,8 @@ import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.services.s3.model.Delete;
+import software.amazon.awssdk.services.s3.model.ObjectIdentifier;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.S3Object;
 
@@ -206,6 +209,37 @@ public class S3Bucket extends Bucket {
                         response.contentLength(),
                         response.metadata()))
                 .exceptionallyCompose(nullIfNotFound());
+    }
+
+    /**
+     * Deletes all the keys starting with the prefix, including the folder placeholder. Not to be used on a bucket
+     * without prefix (the whole S3 bucket).
+     */
+    CompletableFuture<Void> deleteAllAsync() {
+        if (prefix.isEmpty()) {
+            return CompletableFuture.failedFuture(new IllegalStateException("Bucket without prefix"));
+        }
+        // One DeleteObjects request per listing page (at most 1000 keys, the DeleteObjects limit)
+        var deletes = new ArrayList<CompletableFuture<?>>();
+        return client.listObjectsV2Paginator(b -> b.bucket(s3BucketName).prefix(prefix))
+                .subscribe(page -> {
+                    if (page.hasContents() && !page.contents().isEmpty()) {
+                        var ids = page.contents().stream()
+                                .map(o -> ObjectIdentifier.builder().key(o.key()).build())
+                                .toList();
+                        deletes.add(client.deleteObjects(b -> b.bucket(s3BucketName)
+                                .delete(Delete.builder().objects(ids).quiet(true).build()))
+                                .thenAccept(response -> {
+                                    // Quiet mode: only the keys not deleted are reported
+                                    if (response.hasErrors() && !response.errors().isEmpty()) {
+                                        var e = response.errors().get(0);
+                                        throw new CompletionException(new IOException(response.errors().size()
+                                                + " keys not deleted, first " + e.key() + ": " + e.message()));
+                                    }
+                                }));
+                    }
+                })
+                .thenCompose(r -> CompletableFuture.allOf(deletes.toArray(CompletableFuture[]::new)));
     }
 
     private String toKey(String objectName) {
