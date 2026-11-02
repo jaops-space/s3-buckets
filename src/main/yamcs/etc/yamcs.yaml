@@ -28,3 +28,10 @@ bucketProviders:
       - name: ${env.S3_BUCKET:yamcs-dev}
         localName: s3
         prefix: files/
+
+# Limits of the buckets, applied at each start (they are also stored in S3, in <bucket>/.yamcs-bucket); those not
+# listed keep their stored limits, or the defaults (100 MB, 1000 objects)
+buckets:
+  - name: cfdpDown
+    maxSize: 1073741824
+    maxObjects: 10000

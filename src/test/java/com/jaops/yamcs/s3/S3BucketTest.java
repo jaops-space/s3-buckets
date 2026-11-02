@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -28,6 +29,7 @@ import org.yamcs.buckets.ObjectProperties;
 import org.yamcs.utils.TimeEncoding;
 
 import software.amazon.awssdk.core.async.AsyncRequestBody;
+import software.amazon.awssdk.core.async.AsyncResponseTransformer;
 import software.amazon.awssdk.services.s3.S3AsyncClient;
 
 @Testcontainers(disabledWithoutDocker = true)
@@ -77,8 +79,9 @@ public class S3BucketTest {
         return YConfiguration.wrap(new S3BucketProvider().getSpec().validate(config));
     }
 
+    // Without limits, for the tests not about them
     S3Bucket bucket(String prefix) {
-        return new S3Bucket("yamcs-bucket", client, s3BucketName, base + prefix);
+        return new S3Bucket("yamcs-bucket", client, s3BucketName, base + prefix, Long.MAX_VALUE, Integer.MAX_VALUE);
     }
 
     static byte[] bytes(String s) {
@@ -206,6 +209,10 @@ public class S3BucketTest {
         assertEquals(30, props.size());
         assertEquals(Long.MAX_VALUE, props.maxSize());
         assertEquals(Integer.MAX_VALUE, props.maxNumObjects());
+
+        var defaults = new S3Bucket("b", client, s3BucketName, base + "defaults").getPropertiesAsync().join();
+        assertEquals(100L * 1024 * 1024, defaults.maxSize());
+        assertEquals(1000, defaults.maxNumObjects());
         // The S3 bucket creation time if listing the buckets is allowed, otherwise 1970
         assertTrue(props.created() == TimeEncoding.fromUnixMillisec(0)
                 || Math.abs(props.created() - TimeEncoding.getWallclockTime()) < 60_000);
@@ -289,7 +296,8 @@ public class S3BucketTest {
         // Yamcs deletes only empty buckets
         var cfdpDown = buckets.stream().filter(b -> b.getName().equals("cfdpDown")).findFirst().get();
         restarted.deleteBucket(cfdpDown);
-        assertEquals(List.of("displays"), bucketNames(new S3BucketProvider().loadBuckets(folderConfig("yamcs", List.of()))));
+        var remaining = new S3BucketProvider().loadBuckets(folderConfig("yamcs", List.of()));
+        assertEquals(List.of("displays"), bucketNames(remaining));
     }
 
     @Test
@@ -337,6 +345,90 @@ public class S3BucketTest {
         futures.forEach(f -> f.join());
         bucket.deleteAllAsync().join();
         assertTrue(bucket.listObjectsAsync().join().isEmpty());
+    }
+
+    @Test
+    void limitsEnforced() throws Exception {
+        var bucket = new S3Bucket("b", client, s3BucketName, base + "limited", 10, 2);
+        bucket.putObjectAsync("a", null, null, new byte[6]).join();
+        var e = assertThrows(CompletionException.class,
+                () -> bucket.putObjectAsync("b", null, null, new byte[5]).join());
+        assertEquals("Maximum bucket size 10 exceeded", e.getCause().getMessage());
+        // Replacing an object counts its new size only
+        bucket.putObjectAsync("a", null, null, new byte[9]).join();
+        bucket.putObjectAsync("b", null, null, new byte[1]).join();
+        e = assertThrows(CompletionException.class, () -> bucket.putObjectAsync("c", null, null, new byte[0]).join());
+        assertEquals("Maximum number of objects in the bucket 2 exceeded", e.getCause().getMessage());
+        assertEquals(List.of("a", "b"), names(bucket.listObjectsAsync().join()));
+
+        // Raised: in .yamcs-bucket, which is not one of the objects
+        bucket.setMaxObjects(3);
+        bucket.putObjectAsync("c", null, null, new byte[0]).join();
+        assertEquals(3, bucket.getPropertiesAsync().join().numObjects());
+    }
+
+    @Test
+    void limitsStoredAndShared() throws Exception {
+        var provider = new S3BucketProvider();
+        provider.loadBuckets(folderConfig("f", List.of()));
+        var bucket = (S3Bucket) provider.createBucket("cfdpDown");
+        bucket.setMaxSize(5000);
+        bucket.setMaxObjects(7);
+
+        // Another server (or the next start) reads them
+        var other = (S3Bucket) new S3BucketProvider().loadBuckets(folderConfig("f", List.of())).get(0);
+        assertEquals(5000, other.getMaxSize());
+        assertEquals(7, other.getMaxObjects());
+
+        // Changed on one, seen by the other at its next put or properties
+        bucket.setMaxSize(3);
+        var e = assertThrows(CompletionException.class,
+                () -> other.putObjectAsync("x", null, null, new byte[4]).join());
+        assertEquals("Maximum bucket size 3 exceeded", e.getCause().getMessage());
+        bucket.setMaxObjects(8);
+        assertEquals(8, other.getPropertiesAsync().join().maxNumObjects());
+
+        // .yamcs-bucket holds them, a reserved name
+        var text = client.getObject(b -> b.bucket(s3BucketName).key(base + "f/cfdpDown/.yamcs-bucket"),
+                AsyncResponseTransformer.toBytes()).join().asUtf8String();
+        assertEquals("maxSize=3\nmaxObjects=8\n", text);
+        assertTrue(bucket.listObjectsAsync().join().isEmpty());
+        assertThrows(CompletionException.class,
+                () -> bucket.putObjectAsync(".yamcs-bucket", null, null, new byte[0]).join());
+        assertThrows(CompletionException.class, () -> bucket.deleteObjectAsync(".yamcs-bucket").join());
+
+        // Creating an existing bucket again (another server) keeps them; a new one gets the defaults
+        var second = new S3BucketProvider();
+        second.loadBuckets(folderConfig("f", List.of()));
+        var recreated = (S3Bucket) second.createBucket("cfdpDown");
+        assertEquals(3, recreated.getMaxSize());
+        assertEquals(8, recreated.getMaxObjects());
+        assertEquals(1000, ((S3Bucket) second.createBucket("fresh")).getMaxObjects());
+    }
+
+    @Test
+    void limitsOfMappedBucket() throws Exception {
+        // A mapping with a prefix that has no .yamcs-bucket yet gets one when a limit is set
+        var mapped = (S3Bucket) new S3BucketProvider()
+                .loadBuckets(providerConfig(s3BucketName, Map.of("prefix", base + "m"))).get(0);
+        assertEquals(1000, mapped.getMaxObjects());
+        mapped.setMaxObjects(20);
+        var reloaded = (S3Bucket) new S3BucketProvider()
+                .loadBuckets(providerConfig(s3BucketName, Map.of("prefix", base + "m"))).get(0);
+        assertEquals(20, reloaded.getMaxObjects());
+    }
+
+    @Test
+    void providerDefaultLimits() throws Exception {
+        // A folder without placeholder gets the provider entry's limits
+        bucket("f/displays").putObjectAsync("x", null, null, bytes("x")).join();
+        var options = new HashMap<String, Object>();
+        options.put("folder", Map.of("name", s3BucketName, "prefix", base + "f"));
+        options.put("maxSize", 1L << 40);
+        options.put("maxObjects", 50000);
+        var displays = (S3Bucket) new S3BucketProvider().loadBuckets(providerConfig(options)).get(0);
+        assertEquals(1L << 40, displays.getMaxSize());
+        assertEquals(50000, displays.getMaxObjects());
     }
 
     static List<String> names(List<ObjectProperties> objects) {

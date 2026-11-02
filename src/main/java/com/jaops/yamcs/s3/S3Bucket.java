@@ -1,9 +1,12 @@
 package com.jaops.yamcs.s3;
 
 import java.io.IOException;
+import java.io.StringReader;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
@@ -35,8 +38,11 @@ import software.amazon.awssdk.services.s3.model.S3Object;
  * not contain the content type and metadata (S3 does not return them when listing), these are returned only by
  * {@link #findObjectAsync(String)}.
  * <p>
- * The size and object count limits are managed on the S3 side; this bucket does not enforce any limit and reports
- * the maximum values as limits.
+ * The size and object count limits are kept in the object {@value #PLACEHOLDER} of the bucket (the S3 key
+ * {@code <prefix>.yamcs-bucket}, {@code maxSize=<bytes>} and {@code maxObjects=<count>} lines), such that they survive
+ * restarts and are shared by the Yamcs servers using the bucket. The object is not part of the bucket's objects and its
+ * name is reserved. The limits are read again from S3 before each put and when the properties are retrieved, and
+ * enforced on put by listing the bucket.
  */
 public class S3Bucket extends Bucket {
 
@@ -44,6 +50,20 @@ public class S3Bucket extends Bucket {
     private final S3AsyncClient client;
     private final String s3BucketName;
     private final String prefix;
+
+    // As the Yamcs RocksDB and file system buckets
+    public static final long DEFAULT_MAX_SIZE = 100L * 1024 * 1024;
+    public static final int DEFAULT_MAX_OBJECTS = 1000;
+
+    /**
+     * The object holding the bucket limits, and marking the bucket in a folder while it is empty.
+     */
+    public static final String PLACEHOLDER = ".yamcs-bucket";
+    static final String MAX_SIZE_KEY = "maxSize";
+    static final String MAX_OBJECTS_KEY = "maxObjects";
+
+    private volatile long maxSize;
+    private volatile int maxObjects;
 
     private volatile long created = TimeEncoding.INVALID_INSTANT;
 
@@ -59,7 +79,20 @@ public class S3Bucket extends Bucket {
      *            the prefix does not end with one.
      */
     public S3Bucket(String name, S3AsyncClient client, String s3BucketName, String prefix) {
+        this(name, client, s3BucketName, prefix, DEFAULT_MAX_SIZE, DEFAULT_MAX_OBJECTS);
+    }
+
+    /**
+     * @param maxSize
+     *            the size limit, until one is read from {@value #PLACEHOLDER}
+     * @param maxObjects
+     *            the object count limit, until one is read from {@value #PLACEHOLDER}
+     */
+    public S3Bucket(String name, S3AsyncClient client, String s3BucketName, String prefix, long maxSize,
+            int maxObjects) {
         this.name = name;
+        this.maxSize = maxSize;
+        this.maxObjects = maxObjects;
         this.client = client;
         this.s3BucketName = s3BucketName;
         if (prefix.isEmpty() || prefix.endsWith("/")) {
@@ -95,28 +128,91 @@ public class S3Bucket extends Bucket {
     }
 
     /**
-     * Retrieves the bucket properties.
+     * Retrieves the bucket properties, with the limits read again from {@value #PLACEHOLDER}.
      * <p>
      * S3 does not provide the number of objects and the total size of a bucket; they are computed by listing all the
      * objects which may be slow for large buckets.
      */
     @Override
     public CompletableFuture<BucketProperties> getPropertiesAsync() {
-        var stats = new long[2]; // [count, size]
-        var listing = client.listObjectsV2Paginator(b -> b.bucket(s3BucketName).prefix(prefix))
+        return usageAsync(null)
+                .thenCombine(loadLimitsAsync(), (usage, r) -> usage)
+                .thenCombine(getCreatedAsync(), (usage, createdTime) -> new BucketProperties(name, createdTime,
+                        maxObjects, maxSize, (int) Math.min(usage.count, Integer.MAX_VALUE), usage.size));
+    }
+
+    /**
+     * The number of objects and total size, and the size of the object objectName (-1 if not found or null).
+     */
+    private record Usage(long count, long size, long objectSize) {
+    }
+
+    private CompletableFuture<Usage> usageAsync(String objectName) {
+        var stats = new long[] { 0, 0, -1 }; // [count, size, objectSize]
+        return client.listObjectsV2Paginator(b -> b.bucket(s3BucketName).prefix(prefix))
                 .contents()
                 .subscribe(s3Object -> {
-                    if (toObjectName(s3Object) != null) {
+                    var n = toObjectName(s3Object);
+                    if (n != null) {
                         stats[0]++;
                         stats[1] += s3Object.size();
+                        if (n.equals(objectName)) {
+                            stats[2] = s3Object.size();
+                        }
                     }
-                });
-        return listing.thenCombine(getCreatedAsync(), (res, createdTime) -> {
-            // No limits on the S3 side: report the maximum values (0 would mean that the bucket is full and for
-            // example the CFDP service would refuse to download files into it)
-            return new BucketProperties(name, createdTime, Integer.MAX_VALUE, Long.MAX_VALUE,
-                    (int) Math.min(stats[0], Integer.MAX_VALUE), stats[1]);
-        });
+                })
+                .thenApply(r -> new Usage(stats[0], stats[1], stats[2]));
+    }
+
+    /**
+     * Reads the limits from {@value #PLACEHOLDER}. Keeps the current limits if there is none, or for those it does not
+     * have.
+     */
+    CompletableFuture<Void> loadLimitsAsync() {
+        return client.getObject(b -> b.bucket(s3BucketName).key(prefix + PLACEHOLDER),
+                AsyncResponseTransformer.toBytes())
+                .thenAccept(response -> {
+                    var props = new Properties();
+                    try {
+                        props.load(new StringReader(response.asUtf8String()));
+                    } catch (IOException e) {
+                        throw new UncheckedIOException(e); // Not thrown by a StringReader
+                    }
+                    var size = parse(props.getProperty(MAX_SIZE_KEY));
+                    if (size != null) {
+                        maxSize = size;
+                    }
+                    var objects = parse(props.getProperty(MAX_OBJECTS_KEY));
+                    if (objects != null) {
+                        maxObjects = (int) Math.min(objects, Integer.MAX_VALUE);
+                    }
+                })
+                .exceptionallyCompose(nullIfNotFound());
+    }
+
+    private static Long parse(String value) {
+        try {
+            return value == null ? null : Long.valueOf(value.trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Writes the limits to {@value #PLACEHOLDER}.
+     */
+    CompletableFuture<Void> saveLimitsAsync() {
+        var text = MAX_SIZE_KEY + "=" + maxSize + "\n" + MAX_OBJECTS_KEY + "=" + maxObjects + "\n";
+        return client.putObject(b -> b.bucket(s3BucketName).key(prefix + PLACEHOLDER).contentType("text/plain"),
+                AsyncRequestBody.fromString(text)).thenApply(r -> null);
+    }
+
+    public long getMaxSize() {
+        return maxSize;
+    }
+
+    public int getMaxObjects() {
+        return maxObjects;
     }
 
     /**
@@ -141,14 +237,35 @@ public class S3Bucket extends Bucket {
         });
     }
 
+    /**
+     * Sets the size limit and writes it to {@value #PLACEHOLDER}. Does nothing if the limit is already this one.
+     */
     @Override
-    public void setMaxSize(long maxSize) {
-        // Ignore, managed by S3
+    public void setMaxSize(long maxSize) throws IOException {
+        if (maxSize != this.maxSize) {
+            this.maxSize = maxSize;
+            saveLimits();
+        }
     }
 
+    /**
+     * Sets the object count limit and writes it to {@value #PLACEHOLDER}. Does nothing if the limit is already this
+     * one.
+     */
     @Override
-    public void setMaxObjects(int maxObjects) {
-        // Ignore, managed by S3
+    public void setMaxObjects(int maxObjects) throws IOException {
+        if (maxObjects != this.maxObjects) {
+            this.maxObjects = maxObjects;
+            saveLimits();
+        }
+    }
+
+    private void saveLimits() throws IOException {
+        try {
+            saveLimitsAsync().join();
+        } catch (RuntimeException e) {
+            throw new IOException("Cannot save the limits of bucket '" + name + "': " + unwrap(e).getMessage(), e);
+        }
     }
 
     @Override
@@ -173,9 +290,37 @@ public class S3Bucket extends Bucket {
         return listing.thenApply(res -> result);
     }
 
+    /**
+     * Stores the object, if the bucket stays within its limits (read again from {@value #PLACEHOLDER}). The usage is
+     * computed by listing the bucket; two puts at the same time (from this or another server) may both pass.
+     */
     @Override
     public CompletableFuture<Void> putObjectAsync(String objectName, String contentType, Map<String, String> metadata,
             byte[] objectData) {
+        if (PLACEHOLDER.equals(objectName)) {
+            return reserved();
+        }
+        return usageAsync(objectName)
+                .thenCombine(loadLimitsAsync(), (usage, r) -> usage)
+                .thenCompose(usage -> {
+                    var replaced = usage.objectSize >= 0;
+                    var newSize = usage.size - (replaced ? usage.objectSize : 0) + objectData.length;
+                    var newCount = usage.count + (replaced ? 0 : 1);
+                    // The messages of the Yamcs buckets
+                    if (newSize > maxSize) {
+                        return CompletableFuture.failedFuture(
+                                new IOException("Maximum bucket size " + maxSize + " exceeded"));
+                    }
+                    if (newCount > maxObjects) {
+                        return CompletableFuture.failedFuture(
+                                new IOException("Maximum number of objects in the bucket " + maxObjects + " exceeded"));
+                    }
+                    return doPutObjectAsync(objectName, contentType, metadata, objectData);
+                });
+    }
+
+    private CompletableFuture<Void> doPutObjectAsync(String objectName, String contentType,
+            Map<String, String> metadata, byte[] objectData) {
         return client.putObject(b -> {
             b.bucket(s3BucketName).key(toKey(objectName));
             if (contentType != null) {
@@ -197,6 +342,9 @@ public class S3Bucket extends Bucket {
 
     @Override
     public CompletableFuture<Void> deleteObjectAsync(String objectName) {
+        if (PLACEHOLDER.equals(objectName)) {
+            return reserved();
+        }
         return client.deleteObject(b -> b.bucket(s3BucketName).key(toKey(objectName))).thenApply(r -> null);
     }
 
@@ -212,8 +360,8 @@ public class S3Bucket extends Bucket {
     }
 
     /**
-     * Deletes all the keys starting with the prefix, including the folder placeholder. Not to be used on a bucket
-     * without prefix (the whole S3 bucket).
+     * Deletes all the keys starting with the prefix, including {@value #PLACEHOLDER}, and the folder. Not to be used
+     * on a bucket without prefix (the whole S3 bucket).
      */
     CompletableFuture<Void> deleteAllAsync() {
         if (prefix.isEmpty()) {
@@ -239,7 +387,15 @@ public class S3Bucket extends Bucket {
                                 }));
                     }
                 })
-                .thenCompose(r -> CompletableFuture.allOf(deletes.toArray(CompletableFuture[]::new)));
+                .thenCompose(r -> CompletableFuture.allOf(deletes.toArray(CompletableFuture[]::new)))
+                // The folder itself: S3-compatible stores with directories (SeaweedFS) keep it, and it would be found
+                // again as a bucket
+                .thenCompose(r -> client.deleteObject(b -> b.bucket(s3BucketName).key(prefix)))
+                .thenApply(r -> null);
+    }
+
+    private static CompletableFuture<Void> reserved() {
+        return CompletableFuture.failedFuture(new IOException("The object name " + PLACEHOLDER + " is reserved"));
     }
 
     private String toKey(String objectName) {
@@ -248,11 +404,12 @@ public class S3Bucket extends Bucket {
 
     /**
      * Returns the Yamcs object name corresponding to the S3 object or null if the object does not belong to the
-     * bucket (the "folder" placeholder object having the key equal to the prefix).
+     * bucket ({@value #PLACEHOLDER}, or the "folder" object having the key equal to the prefix that some S3 consoles
+     * make).
      */
     private String toObjectName(S3Object s3Object) {
         var objectName = s3Object.key().substring(prefix.length());
-        return objectName.isEmpty() ? null : objectName;
+        return objectName.isEmpty() || objectName.equals(PLACEHOLDER) ? null : objectName;
     }
 
     private static <T> Function<Throwable, CompletableFuture<T>> nullIfNotFound() {

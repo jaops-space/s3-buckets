@@ -20,7 +20,6 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.async.AsyncRequestBody;
 import software.amazon.awssdk.core.checksums.RequestChecksumCalculation;
 import software.amazon.awssdk.core.checksums.ResponseChecksumValidation;
 import software.amazon.awssdk.regions.Region;
@@ -34,8 +33,11 @@ import software.amazon.awssdk.services.s3.model.CommonPrefix;
  * <p>
  * The buckets are those listed in the configuration, and with a {@code folder}, each sub-folder of the folder (an S3
  * bucket and a key prefix): those found at startup, and those created from Yamcs (the provider entry having
- * {@code createBuckets: true}) as an empty "folder" placeholder object. Only the buckets of the folder can be deleted
- * from Yamcs.
+ * {@code createBuckets: true}) with their {@value S3Bucket#PLACEHOLDER} object. Only the buckets of the folder can be
+ * deleted from Yamcs.
+ * <p>
+ * The limits of a bucket are kept in its {@value S3Bucket#PLACEHOLDER} (see {@link S3Bucket}); a bucket without has
+ * the {@code maxSize} and {@code maxObjects} of the provider entry.
  */
 public class S3BucketProvider implements BucketProvider {
 
@@ -50,6 +52,8 @@ public class S3BucketProvider implements BucketProvider {
     static final Pattern BUCKET_NAME = Pattern.compile("\\w[\\w\\-]+");
 
     private S3AsyncClient client;
+    private long defaultMaxSize;
+    private int defaultMaxObjects;
     // The S3 bucket and key prefix (empty or ending with a slash) of the folder; null without folder
     private String folderS3BucketName;
     private String folderPrefix;
@@ -84,6 +88,8 @@ public class S3BucketProvider implements BucketProvider {
                 .withElementType(OptionType.MAP)
                 .withSpec(bucketSpec);
         spec.addOption("folder", OptionType.MAP).withSpec(folderSpec);
+        spec.addOption("maxSize", OptionType.INTEGER).withDefault(S3Bucket.DEFAULT_MAX_SIZE);
+        spec.addOption("maxObjects", OptionType.INTEGER).withDefault(S3Bucket.DEFAULT_MAX_OBJECTS);
         spec.requireOneOf("buckets", "folder");
         spec.requireTogether("accessKeyId", "secretAccessKey");
         return spec;
@@ -92,6 +98,8 @@ public class S3BucketProvider implements BucketProvider {
     @Override
     public List<Bucket> loadBuckets(YConfiguration config) throws IOException {
         client = createClient(config);
+        defaultMaxSize = config.getLong("maxSize");
+        defaultMaxObjects = config.getInt("maxObjects");
 
         var buckets = new ArrayList<Bucket>();
         var names = new HashSet<String>();
@@ -101,7 +109,7 @@ public class S3BucketProvider implements BucketProvider {
                 var localName = bucketConfig.getString("localName", s3BucketName);
                 var prefix = bucketConfig.getString("prefix", "");
 
-                var bucket = new S3Bucket(localName, client, s3BucketName, prefix);
+                var bucket = new S3Bucket(localName, client, s3BucketName, prefix, defaultMaxSize, defaultMaxObjects);
                 checkAccessible(bucket);
                 buckets.add(bucket);
                 names.add(localName);
@@ -125,6 +133,17 @@ public class S3BucketProvider implements BucketProvider {
                 } else {
                     buckets.add(folderBucket(name));
                 }
+            }
+        }
+
+        // The stored limits; they are read again before each put, so a bucket that fails here gets them later
+        for (var bucket : buckets) {
+            var s3Bucket = (S3Bucket) bucket;
+            try {
+                s3Bucket.loadLimitsAsync().join();
+            } catch (RuntimeException e) {
+                log.warn("Cannot read the limits of bucket '{}': {}", bucket.getName(),
+                        S3Bucket.unwrap(e).getMessage());
             }
         }
         return buckets;
@@ -151,12 +170,14 @@ public class S3BucketProvider implements BucketProvider {
 
     private S3Bucket folderBucket(String name) {
         folderBuckets.add(name);
-        return new S3Bucket(name, client, folderS3BucketName, folderPrefix + name + "/");
+        return new S3Bucket(name, client, folderS3BucketName, folderPrefix + name + "/", defaultMaxSize,
+                defaultMaxObjects);
     }
 
     /**
-     * Creates the bucket as a sub-folder of the folder, with an empty placeholder object such that it is found at
-     * the next start while empty. An existing sub-folder of that name becomes the bucket, with its objects.
+     * Creates the bucket as a sub-folder of the folder, with its {@value S3Bucket#PLACEHOLDER} holding the default
+     * limits, such that it is found at the next start while empty. An existing sub-folder of that name becomes the
+     * bucket, with its objects and its stored limits.
      */
     @Override
     public Bucket createBucket(String bucketName) throws IOException {
@@ -166,8 +187,7 @@ public class S3BucketProvider implements BucketProvider {
         }
         var bucket = folderBucket(bucketName);
         try {
-            client.putObject(b -> b.bucket(folderS3BucketName).key(bucket.getPrefix()), AsyncRequestBody.empty())
-                    .join();
+            bucket.loadLimitsAsync().thenCompose(r -> bucket.saveLimitsAsync()).join();
         } catch (RuntimeException e) {
             folderBuckets.remove(bucketName);
             throw new IOException("Cannot create the bucket '" + bucketName + "' in s3://" + folderS3BucketName + "/"
@@ -179,7 +199,7 @@ public class S3BucketProvider implements BucketProvider {
 
     /**
      * Deletes a bucket of the folder: all the keys of its sub-folder (Yamcs deletes only empty buckets, so normally
-     * only the placeholder). The buckets listed in the configuration cannot be deleted.
+     * only its {@value S3Bucket#PLACEHOLDER}). The buckets listed in the configuration cannot be deleted.
      */
     @Override
     public void deleteBucket(Bucket bucket) throws IOException {

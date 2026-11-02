@@ -74,9 +74,9 @@ Default: `false`.
 
 folder (map)
 : An S3 bucket and key prefix whose sub-folders are Yamcs buckets: `<prefix><bucket>/<object>`. Those present at
-startup are loaded; a bucket created from Yamcs (`createBuckets`) is an empty placeholder object `<prefix><bucket>/`
-(an existing sub-folder of that name becomes the bucket, with its objects); deleting an (empty) bucket from Yamcs
-deletes its sub-folder. Sub-folders whose name is not a valid Yamcs bucket name (letters, digits, `_` and `-`), or is
+startup are loaded; a bucket created from Yamcs (`createBuckets`) gets its `.yamcs-bucket` object (see Limits),
+which keeps it while empty (an existing sub-folder of that name becomes the bucket, with its objects and limits);
+deleting an (empty) bucket from Yamcs deletes its sub-folder. Sub-folders whose name is not a valid Yamcs bucket name (letters, digits, `_` and `-`), or is
 the `localName` of a bucket in `buckets`, are ignored. Options:
 
   name (string)
@@ -84,6 +84,10 @@ the `localName` of a bucket in `buckets`, are ignored. Options:
 
   prefix (string)
   : Key prefix of the folder. A `/` is appended if missing. Default: the whole S3 bucket.
+
+maxSize (integer), maxObjects (integer)
+: The limits of the buckets that have none stored (see Limits). Default: 104857600 (100 MB) and 1000, as the other
+Yamcs buckets.
 
 buckets (list of maps)
 : The S3 buckets made available in Yamcs; `buckets`, `folder` or both are required. Each entry has the options:
@@ -103,15 +107,34 @@ At startup, the access to each S3 bucket of `buckets` is verified in the backgro
 bucket cannot be accessed, but Yamcs still starts. The `folder` is listed at startup: Yamcs does not start if it
 cannot be listed.
 
+## Limits
+
+Each bucket has a size limit and an object count limit, kept in S3 with the bucket like Yamcs keeps those of its
+RocksDB buckets: in the object `.yamcs-bucket` of the bucket (S3 key `<prefix>.yamcs-bucket`), shared by all the Yamcs
+servers using the bucket:
+
+```
+maxSize=104857600
+maxObjects=1000
+```
+
+A bucket without it has the provider's `maxSize` and `maxObjects`. Setting a limit in Yamcs (the `maxSize` and
+`maxObjects` of a `buckets` entry in `etc/yamcs.yaml`, applied at each start) writes it there; it can also be edited
+in S3 directly. `.yamcs-bucket` is not listed with the objects and is a reserved object name.
+
+The limits are read again from S3 before each put and when the bucket properties are retrieved (which the CFDP
+service does before accepting a file). A put that would exceed a limit is refused; the usage is computed by listing
+the bucket at each put, so two puts at the same time may both pass.
+
 ## Limitations
 
 * S3 does not provide the creation time of the objects: the last modification time is shown instead.
 * The object listings do not contain the content type and the metadata (S3 does not return them when listing); they
   are available when retrieving a single object.
-* The bucket size and the number of objects are computed by listing all the objects, which is slow for large buckets.
+* The bucket size and the number of objects are computed by listing all the objects, at each put and when the
+  properties are retrieved, which is slow for large buckets (1000 objects per S3 request).
 * The bucket creation time is shown only if the credentials allow listing the S3 buckets; otherwise 1970-01-01 is
   shown.
-* Size and object count limits are not managed by Yamcs: the bucket reports unlimited capacity.
 * User metadata is sent as S3 user metadata (`x-amz-meta-*`): the keys are converted to lower case and the total size
   is limited (2 KB on AWS).
 * Objects are transferred in one request and kept in memory (as for all Yamcs buckets); the maximum object size is
